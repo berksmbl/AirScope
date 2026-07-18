@@ -9,6 +9,10 @@ channel recommendation engine.
 ![stack](https://img.shields.io/badge/TailwindCSS-v4-38bdf8)
 ![stack](https://img.shields.io/badge/Recharts-3-8884d8)
 
+![Live Spectrum Dashboard](./public/spectrum-dashboard.png)
+
+![Channel Congestion Heatmap](./public/congestion-heatmap.png)
+
 ## Features
 
 - **Device connection panel** — RouterOS API (port 8728) with saved device
