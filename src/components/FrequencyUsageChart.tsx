@@ -73,7 +73,9 @@ export function FrequencyUsageChart({ scanner }: { scanner: Scanner }) {
     recommendation,
     compareScan,
     resetUsagePeaks,
+    sector,
   } = scanner;
+  const active = sector?.channel ?? null;
   const usage = useMemo(
     () =>
       (snapshot?.usage ?? [])
@@ -220,6 +222,19 @@ export function FrequencyUsageChart({ scanner }: { scanner: Scanner }) {
                 axisLine={false}
                 tickFormatter={(v: number) => `${v}%`}
               />
+
+              {active &&
+                active.freq + active.width / 2 >= range[0] &&
+                active.freq - active.width / 2 <= range[1] && (
+                  <ReferenceArea
+                    x1={Math.max(range[0], active.freq - active.width / 2)}
+                    x2={Math.min(range[1], active.freq + active.width / 2)}
+                    fill="var(--good)"
+                    fillOpacity={0.1}
+                    stroke="var(--good)"
+                    strokeOpacity={0.55}
+                  />
+                )}
 
               {interference
                 .filter((r) => r.to >= range[0] && r.from <= range[1])

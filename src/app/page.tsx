@@ -9,6 +9,7 @@ import { SpectrumChart } from "@/components/SpectrumChart";
 import { FrequencyUsageChart } from "@/components/FrequencyUsageChart";
 import { ChannelHeatmap } from "@/components/ChannelHeatmap";
 import { NetworkList } from "@/components/NetworkList";
+import { SectorPanel } from "@/components/SectorPanel";
 import { RecommendationCard } from "@/components/RecommendationCard";
 import { HistoryPanel } from "@/components/HistoryPanel";
 
@@ -34,7 +35,10 @@ export default function Home() {
             <FrequencyUsageChart scanner={scanner} />
             <ChannelHeatmap scanner={scanner} />
             <div className="grid grid-cols-1 gap-4 2xl:grid-cols-[minmax(0,1.6fr)_minmax(0,1fr)]">
-              <NetworkList scanner={scanner} />
+              <div className="flex min-w-0 flex-col gap-4">
+                <NetworkList scanner={scanner} />
+                <SectorPanel scanner={scanner} />
+              </div>
               <div className="flex flex-col gap-4">
                 <RecommendationCard scanner={scanner} />
                 <HistoryPanel scanner={scanner} />

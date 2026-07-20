@@ -1,7 +1,7 @@
 "use client";
 
-import { Activity, Pause, Play, SlidersHorizontal } from "lucide-react";
-import { Button, Card, Field, Segmented } from "./ui";
+import { Activity, HardDriveDownload, Pause, Play, SlidersHorizontal, Undo2 } from "lucide-react";
+import { Button, Card, Chip, Field, Segmented } from "./ui";
 import { BANDS, BAND_ORDER } from "@/lib/bands";
 import { clamp } from "@/lib/utils";
 import type { Scanner } from "@/hooks/useScanner";
@@ -85,10 +85,17 @@ export function ScanControls({ scanner }: { scanner: Scanner }) {
     scanError,
     connState,
     collectingFor,
+    device,
+    scanListInfo,
+    applyScanListToDevice,
+    restoreDeviceScanList,
   } = scanner;
 
   const def = BANDS[band];
   const connected = connState === "connected";
+  const desiredScanList = `${range[0]}-${range[1]}`;
+  const showScanList =
+    connected && device?.wifiKind === "wireless" && scanListInfo !== null;
 
   return (
     <Card title="Scan control" icon={<SlidersHorizontal size={14} />}>
@@ -109,6 +116,38 @@ export function ScanControls({ scanner }: { scanner: Scanner }) {
             onChange={setFreqRange}
           />
         </Field>
+
+        {showScanList && scanListInfo && (
+          <div className="flex flex-wrap items-center gap-1.5 rounded-lg border border-line bg-panel-2 px-2.5 py-2">
+            <span className="text-[11px] text-ink-3">Device sweeps</span>
+            <Chip
+              className="mono"
+              title="The interface's scan-list — the range the radio actually sweeps. The slider above only filters the view."
+            >
+              {scanListInfo.current}
+            </Chip>
+            {scanListInfo.current !== desiredScanList && (
+              <Button
+                variant="ghost"
+                className="h-6 px-2 text-[11px]"
+                title={`Write scan-list=${desiredScanList} to the device so the radio sweeps exactly the selected range (persistent config — restore anytime)`}
+                onClick={applyScanListToDevice}
+              >
+                <HardDriveDownload size={12} /> Apply {desiredScanList}
+              </Button>
+            )}
+            {scanListInfo.original && (
+              <Button
+                variant="ghost"
+                className="h-6 px-2 text-[11px]"
+                title={`Restore the original scan-list (${scanListInfo.original})`}
+                onClick={restoreDeviceScanList}
+              >
+                <Undo2 size={12} /> Restore
+              </Button>
+            )}
+          </div>
+        )}
 
         <Field label="Scan mode">
           <Segmented<ScanMode>

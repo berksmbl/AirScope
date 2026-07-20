@@ -18,8 +18,10 @@ import type {
   DeviceInfo,
   FreqUsagePoint,
   InterferenceRegion,
+  ScanListInfo,
   ScanMode,
   ScanSnapshot,
+  SectorStatus,
   SpectrumPoint,
   StoredScan,
 } from "@/lib/types";
@@ -78,6 +80,12 @@ export function useScanner() {
   const [snapshot, setSnapshot] = useState<ScanSnapshot | null>(null);
   const [waterfall, setWaterfall] = useState<SpectrumPoint[][]>([]);
   const [focus, setFocus] = useState<Focus | null>(null);
+  /** live sector health — polled independently of scanning (non-disruptive) */
+  const [sector, setSector] = useState<SectorStatus | null>(null);
+  /** the range the radio actually sweeps (device scan-list) */
+  const [scanListInfo, setScanListInfo] = useState<ScanListInfo | null>(null);
+  // per-client signal/ccq rings for sparklines (keyed by MAC)
+  const clientHistory = useRef(new Map<string, { signal: number; ccq: number | null }[]>());
   // shared crosshair: hovering any chart highlights the same frequency on all
   const [hoverFreq, setHoverFreqState] = useState<number | null>(null);
   const setHoverFreq = useCallback((f: number | null) => {
@@ -118,10 +126,12 @@ export function useScanner() {
     setWaterfall([]);
     setFocus(null);
     setCollectingFor(0);
+    setSector(null);
     colorMap.current.clear();
     regionMemory.current = [];
     netsMemory.current = [];
     usageMemory.current = null;
+    clientHistory.current.clear();
     tickRef.current = 0;
   }, []);
 
@@ -145,19 +155,21 @@ export function useScanner() {
 
       const first = info.interfaces[0] ?? null;
       setIface(first?.name ?? null);
-      // land on the band the radio actually lives in
+      setScanListInfo(
+        first?.scanList ? { current: first.scanList, original: null } : null
+      );
+      // land on the band the radio actually lives in; scanning itself stays
+      // manual so range/mode/scan-list can be configured first
       if (first?.frequency) {
         const b = bandForFrequency(first.frequency);
         setBandState(b);
         setRange([BANDS[b].defaultMin, BANDS[b].defaultMax]);
       }
-      // start discovering immediately — that's what the user came for
-      if (first) setScanning(true);
-      return true;
+      return info;
     } catch (err) {
       setConnState("error");
       setConnError(err instanceof Error ? err.message : "Connection failed");
-      return false;
+      return null;
     }
   }, [resetData]);
 
@@ -167,6 +179,7 @@ export function useScanner() {
     setIface(null);
     setConnState("disconnected");
     setScanning(false);
+    setScanListInfo(null);
     resetData();
   }, [resetData]);
 
@@ -174,9 +187,53 @@ export function useScanner() {
   const selectIface = useCallback(
     (name: string) => {
       setIface(name);
+      const info = device?.interfaces.find((i) => i.name === name);
+      setScanListInfo(
+        info?.scanList ? { current: info.scanList, original: null } : null
+      );
       resetData();
     },
-    [resetData]
+    [device, resetData]
+  );
+
+  /**
+   * Write the selected range to the device's scan-list ("set") or put the
+   * remembered original back ("restore"). Explicit user actions — this is
+   * persistent device config. Server restarts its monitors afterwards.
+   */
+  const scanListAction = useCallback(
+    async (action: "set" | "restore") => {
+      const creds = credsRef.current;
+      if (!creds || !device || !iface || device.wifiKind !== "wireless") return;
+      try {
+        const res = await fetch("/api/device/scanlist", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...creds,
+            iface,
+            action,
+            value: action === "set" ? `${range[0]}-${range[1]}` : undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error ?? "scan-list update failed");
+        setScanListInfo(data.scanList as ScanListInfo);
+        // monitors were restarted server-side — old frames mix ranges
+        setWaterfall([]);
+        setCollectingFor(0);
+        setScanError(null);
+      } catch (err) {
+        setScanError(err instanceof Error ? err.message : "scan-list update failed");
+      }
+    },
+    [device, iface, range]
+  );
+
+  const applyScanListToDevice = useCallback(() => scanListAction("set"), [scanListAction]);
+  const restoreDeviceScanList = useCallback(
+    () => scanListAction("restore"),
+    [scanListAction]
   );
 
   // ── live data feed ──
@@ -334,6 +391,47 @@ export function useScanner() {
     };
   }, [scanning, mode, device, iface]);
 
+  // ── sector health loop ──
+  // Plain reads (monitor once + registration-table): never touch the radio's
+  // channel, so this runs whenever we're connected — scanning or not.
+  useEffect(() => {
+    if (connState !== "connected" || !device || !iface || !credsRef.current) {
+      return;
+    }
+    const creds = credsRef.current;
+    let cancelled = false;
+
+    const tick = async () => {
+      try {
+        const res = await fetch("/api/device/sector", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...creds, iface }),
+        });
+        if (!res.ok || cancelled) return;
+        const data = await res.json();
+        const s: SectorStatus = data.sector;
+        for (const c of s.clients) {
+          const h = clientHistory.current.get(c.mac) ?? [];
+          h.push({ signal: c.signal, ccq: c.ccq ?? null });
+          if (h.length > 150) h.shift();
+          clientHistory.current.set(c.mac, h);
+        }
+        // during a sweep `monitor` can't report a channel — keep the last known
+        setSector((prev) => ({ ...s, channel: s.channel ?? prev?.channel }));
+      } catch {
+        /* transient — next tick retries */
+      }
+    };
+
+    void tick();
+    const id = setInterval(() => void tick(), 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [connState, device, iface]);
+
   // ── parameter changes reset transient views ──
   const setBand = useCallback((b: Band) => {
     setBandState(b);
@@ -453,6 +551,9 @@ export function useScanner() {
     scanError,
     collectingFor,
     resetUsagePeaks,
+    scanListInfo,
+    applyScanListToDevice,
+    restoreDeviceScanList,
     // data
     snapshot,
     waterfall,
@@ -464,6 +565,8 @@ export function useScanner() {
     recommendation,
     avgCongestion,
     interference,
+    sector,
+    clientHistory: clientHistory.current,
     // history
     history,
     saveCurrentScan,

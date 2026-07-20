@@ -1,12 +1,24 @@
 "use client";
 
-import { Sparkles } from "lucide-react";
+import { useMemo } from "react";
+import { ArrowRight, Sparkles } from "lucide-react";
 import { Card, Chip } from "./ui";
 import { heatColor } from "./ChannelHeatmap";
 import type { Scanner } from "@/hooks/useScanner";
 
 export function RecommendationCard({ scanner }: { scanner: Scanner }) {
-  const { recommendation, setFocus, focus } = scanner;
+  const { recommendation, setFocus, focus, sector, snapshot } = scanner;
+
+  // how does the channel we're serving on right now compare?
+  const activeScore = useMemo(() => {
+    const ch = sector?.channel;
+    if (!ch || !snapshot) return null;
+    const overlapping = snapshot.channels.filter(
+      (c) => Math.abs(c.freq - ch.freq) < ch.width / 2 + 10
+    );
+    if (overlapping.length === 0) return null;
+    return Math.max(...overlapping.map((c) => c.score));
+  }, [sector, snapshot]);
 
   return (
     <Card title="Smart recommendation" icon={<Sparkles size={14} />}>
@@ -38,6 +50,29 @@ export function RecommendationCard({ scanner }: { scanner: Scanner }) {
               Channel {recommendation.channel} · {recommendation.reason}
             </div>
           </button>
+
+          {activeScore !== null && sector?.channel && (
+            <div
+              className="flex items-center gap-2 rounded-lg border border-line bg-panel-2 px-3 py-2 text-[12.5px]"
+              title="Worst congestion score across the channels your active band overlaps"
+            >
+              <span className="text-ink-2">Serving on</span>
+              <span className="mono font-medium text-ink">{sector.channel.freq} MHz</span>
+              <span
+                className="size-2 rounded-full"
+                style={{ backgroundColor: heatColor(activeScore) }}
+              />
+              <span className="mono text-ink-2">{activeScore}/100</span>
+              {activeScore - recommendation.score > 10 ? (
+                <span className="ml-auto flex items-center gap-1 text-good">
+                  <ArrowRight size={13} />
+                  switch saves {activeScore - recommendation.score} pts
+                </span>
+              ) : (
+                <span className="ml-auto text-ink-3">already near-optimal</span>
+              )}
+            </div>
+          )}
 
           {recommendation.blocks.length > 0 && (
             <div>

@@ -117,13 +117,16 @@ export function Chip({
   children,
   color,
   className,
+  title,
 }: {
   children: ReactNode;
   color?: "good" | "warn" | "critical" | "neutral" | "accent";
   className?: string;
+  title?: string;
 }) {
   return (
     <span
+      title={title}
       className={cn(
         "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium border",
         color === "good" && "text-good border-good/35 bg-good/10",

@@ -19,9 +19,12 @@ export function ConnectionPanel({ scanner }: { scanner: Scanner }) {
   const [profiles, persist] = useStoredJson<DeviceProfile[]>(PROFILES_KEY);
   const port = parseInt(portStr, 10) || 8728;
 
-  const saveProfile = () => {
+  const saveProfile = (identity?: string) => {
     if (!host) return;
-    const profile: DeviceProfile = { id: uid(), name: `${user}@${host}`, host, user, port };
+    // reuse an earlier identity if we're saving the same target without one
+    const prior = profiles.find((p) => p.host === host && p.user === user);
+    const name = identity || prior?.name || `${user}@${host}`;
+    const profile: DeviceProfile = { id: uid(), name, host, user, port };
     persist([profile, ...profiles.filter((p) => p.host !== host || p.user !== user)].slice(0, 8));
   };
 
@@ -86,9 +89,9 @@ export function ConnectionPanel({ scanner }: { scanner: Scanner }) {
                 className="flex-1"
                 disabled={connecting || !host || !user}
                 onClick={() =>
-                  void connect({ host, user, password, port }).then((ok) => {
-                    // successful targets are worth remembering
-                    if (ok) saveProfile();
+                  void connect({ host, user, password, port }).then((info) => {
+                    // remember successful targets under the device's own name
+                    if (info) saveProfile(info.identity);
                   })
                 }
               >
@@ -116,12 +119,21 @@ export function ConnectionPanel({ scanner }: { scanner: Scanner }) {
                       className="group flex items-center gap-2 rounded-lg border border-line bg-panel-2 px-2.5 py-1.5 text-[12.5px] transition-colors hover:border-accent/40 cursor-pointer"
                       onClick={() => loadProfile(p)}
                     >
-                      <Cpu size={13} className="text-ink-3" />
-                      <span className="truncate text-ink-2">{p.name}</span>
-                      <span className="mono ml-auto text-[11px] text-ink-3">:{p.port}</span>
+                      <Cpu size={13} className="shrink-0 text-ink-3" />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate font-medium text-ink">
+                          {p.name}
+                        </span>
+                        {p.name !== `${p.user}@${p.host}` && (
+                          <span className="mono block truncate text-[10.5px] text-ink-3">
+                            {p.user}@{p.host}
+                          </span>
+                        )}
+                      </span>
+                      <span className="mono shrink-0 text-[11px] text-ink-3">:{p.port}</span>
                       <button
                         type="button"
-                        className="opacity-0 transition-opacity group-hover:opacity-100 text-ink-3 hover:text-critical"
+                        className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100 text-ink-3 hover:text-critical"
                         onClick={(e) => {
                           e.stopPropagation();
                           persist(profiles.filter((x) => x.id !== p.id));

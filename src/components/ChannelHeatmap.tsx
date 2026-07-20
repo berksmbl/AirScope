@@ -12,10 +12,20 @@ const HEAT_STOPS = ["#0ca30c", "#7ab00d", "#fab219", "#ec835a", "#d03b3b"];
 export const heatColor = (score: number) => lerpColor(HEAT_STOPS, score / 100);
 
 export function ChannelHeatmap({ scanner }: { scanner: Scanner }) {
-  const { snapshot, focus, setFocus, hoverFreq, setHoverFreq, recommendation, interference, band } =
-    scanner;
+  const {
+    snapshot,
+    focus,
+    setFocus,
+    hoverFreq,
+    setHoverFreq,
+    recommendation,
+    interference,
+    band,
+    sector,
+  } = scanner;
   const channels = snapshot?.channels ?? [];
   const labelByFreq = BANDS[band].labelBy === "freq";
+  const active = sector?.channel ?? null;
 
   return (
     <Card
@@ -47,6 +57,8 @@ export function ChannelHeatmap({ scanner }: { scanner: Scanner }) {
             const isFocused = focus?.kind === "channel" && focus.key === c.freq;
             const isBest = recommendation?.freq === c.freq;
             const isHovered = hoverFreq !== null && Math.abs(hoverFreq - c.freq) <= 10;
+            const isActive =
+              active !== null && Math.abs(active.freq - c.freq) < active.width / 2 + 10;
             const dark = c.score > 40;
             return (
               <button
@@ -60,8 +72,9 @@ export function ChannelHeatmap({ scanner }: { scanner: Scanner }) {
                 className={cn(
                   "heat-cell relative flex aspect-[1.5] flex-col items-center justify-center rounded-lg",
                   isFocused && "ring-2 ring-[var(--accent)] ring-offset-2 ring-offset-[var(--panel)]",
-                  isBest && !isFocused && "ring-1 ring-white/40",
-                  isHovered && !isFocused && "ring-2 ring-ink/60"
+                  isActive && !isFocused && "ring-2 ring-[var(--good)]",
+                  isBest && !isFocused && !isActive && "ring-1 ring-white/40",
+                  isHovered && !isFocused && !isActive && "ring-2 ring-ink/60"
                 )}
                 style={{ backgroundColor: heatColor(c.score) }}
               >
@@ -133,8 +146,9 @@ export function ChannelHeatmap({ scanner }: { scanner: Scanner }) {
       {channels.length > 0 && (
         <p className="border-t border-line px-4 py-2 text-[11.5px] text-ink-3">
           Cell = 20 MHz channel · score = worse of Wi-Fi congestion and raw RF usage ·
-          ★ = recommended · <Radio size={10} className="inline -mt-0.5" /> = non-Wi-Fi
-          energy · click to highlight on the spectrum
+          ★ = recommended · <span className="text-good">▣</span> = active channel ·{" "}
+          <Radio size={10} className="inline -mt-0.5" /> = non-Wi-Fi energy · click to
+          highlight on the spectrum
         </p>
       )}
     </Card>

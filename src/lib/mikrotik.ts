@@ -7,6 +7,9 @@ import type {
   DetectedNetwork,
   DeviceInfo,
   FreqUsagePoint,
+  ScanListInfo,
+  SectorClient,
+  SectorStatus,
   WirelessIface,
 } from "./types";
 
@@ -84,6 +87,7 @@ function toIface(r: RosRow): WirelessIface {
     frequency: num(r.frequency) ?? undefined,
     mode: r.mode,
     ssid: r.ssid,
+    scanList: r["scan-list"],
   };
 }
 
@@ -191,6 +195,145 @@ export function normalizeScanRows(rows: RosRow[]): DetectedNetwork[] {
     if (!prev || n.signal > prev.signal) map.set(n.bssid, n);
   }
   return [...map.values()].sort((a, b) => b.signal - a.signal);
+}
+
+/* ── Device scan-list control ───────────────────────────────────────
+ * RouterOS scan & frequency-monitor take no range parameter — they sweep
+ * whatever the interface's scan-list says. To let the UI range actually
+ * drive the hardware sweep we write scan-list on the device (an explicit,
+ * user-triggered action). The pre-change value is remembered so it can be
+ * restored with one click. Running monitors are stopped so the next poll
+ * restarts them against the new list.
+ */
+
+const go = globalThis as unknown as { __origScanLists?: Map<string, string> };
+const origScanLists: Map<string, string> = (go.__origScanLists ??= new Map());
+
+async function findWirelessIface(
+  api: RouterOSAPI,
+  iface: string
+): Promise<{ id: string; scanList: string }> {
+  const rows = (await api.write("/interface/wireless/print", [
+    `?name=${iface}`,
+  ])) as RosRow[];
+  const r = rows[0];
+  if (!r) throw new Error(`Interface ${iface} not found`);
+  return { id: r[".id"], scanList: r["scan-list"] ?? "default" };
+}
+
+export async function getScanListInfo(
+  creds: Credentials,
+  iface: string
+): Promise<ScanListInfo> {
+  const api = await getConnection(creds);
+  const { scanList } = await findWirelessIface(api, iface);
+  return {
+    current: scanList,
+    original: origScanLists.get(monitorKey(creds, iface)) ?? null,
+  };
+}
+
+export async function applyScanList(
+  creds: Credentials,
+  iface: string,
+  value: string
+): Promise<ScanListInfo> {
+  const api = await getConnection(creds);
+  const key = monitorKey(creds, iface);
+  const { id, scanList } = await findWirelessIface(api, iface);
+  if (scanList === value) {
+    return { current: scanList, original: origScanLists.get(key) ?? null };
+  }
+  // remember the true original only once, across repeated applies
+  if (!origScanLists.has(key)) origScanLists.set(key, scanList);
+  await api.write("/interface/wireless/set", [`=.id=${id}`, `=scan-list=${value}`]);
+  // monitors must restart to sweep the new list
+  await stopScanMonitors(creds);
+  await stopUsageMonitors(creds);
+  return { current: value, original: origScanLists.get(key) ?? null };
+}
+
+export async function restoreScanList(
+  creds: Credentials,
+  iface: string
+): Promise<ScanListInfo> {
+  const key = monitorKey(creds, iface);
+  const original = origScanLists.get(key);
+  if (original === undefined) return getScanListInfo(creds, iface);
+  const api = await getConnection(creds);
+  const { id } = await findWirelessIface(api, iface);
+  await api.write("/interface/wireless/set", [`=.id=${id}`, `=scan-list=${original}`]);
+  origScanLists.delete(key);
+  await stopScanMonitors(creds);
+  await stopUsageMonitors(creds);
+  return { current: original, original: null };
+}
+
+/* ── Sector status (non-disruptive) ─────────────────────────────────
+ * `monitor once` + registration-table are plain reads: they never take
+ * the radio off its service channel, so they can run continuously —
+ * even alongside a scan or frequency sweep — without dropping clients.
+ */
+
+function parseSectorClient(r: RosRow): SectorClient {
+  // RouterOS reports "bytes" as "tx,rx"
+  const [txB, rxB] = String(r.bytes ?? "0,0")
+    .split(",")
+    .map((v) => parseInt(v.replace(/\D/g, ""), 10) || 0);
+  return {
+    mac: r["mac-address"] ?? "",
+    radioName: r["radio-name"],
+    signal: num(r["signal-strength"]) ?? -100,
+    snr: num(r["signal-to-noise"]) ?? undefined,
+    ccq: num(r["rx-ccq"]) ?? undefined,
+    txRate: r["tx-rate"],
+    rxRate: r["rx-rate"],
+    txBytes: txB,
+    rxBytes: rxB,
+    uptime: r.uptime,
+    distance: num(r.distance) ?? undefined,
+    retx: num(r["tdma-retx"]) ?? undefined,
+    version: r["routeros-version"],
+  };
+}
+
+export async function getSectorStatus(
+  creds: Credentials,
+  iface: string
+): Promise<SectorStatus> {
+  const api = await getConnection(creds);
+  const out: SectorStatus = { clients: [] };
+
+  try {
+    const [m] = (await api.write("/interface/wireless/monitor", [
+      `=numbers=${iface}`,
+      "=once=",
+    ])) as RosRow[];
+    if (m) {
+      out.status = m.status;
+      out.protocol = m["wireless-protocol"];
+      out.noiseFloor = num(m["noise-floor"]) ?? undefined;
+      const ch = parseChannel(m.channel);
+      if (ch) out.channel = ch;
+    }
+  } catch {
+    /* interface may be mid-scan — monitor is best-effort */
+  }
+
+  try {
+    const rows = (await api.write(
+      "/interface/wireless/registration-table/print"
+    )) as RosRow[];
+    out.clients = rows
+      .filter((r) => !r.interface || r.interface === iface)
+      .map(parseSectorClient)
+      .filter((c) => c.mac)
+      .sort((a, b) => b.signal - a.signal);
+  } catch {
+    /* registration table unavailable */
+  }
+
+  return out;
 }
 
 /* ── Continuous background scan ─────────────────────────────────────

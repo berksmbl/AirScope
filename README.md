@@ -9,6 +9,10 @@ channel recommendation engine.
 ![stack](https://img.shields.io/badge/TailwindCSS-v4-38bdf8)
 ![stack](https://img.shields.io/badge/Recharts-3-8884d8)
 
+![Live Spectrum Dashboard](./public/spectrum-dashboard.png)
+
+![Channel Congestion Heatmap](./public/congestion-heatmap.png)
+
 ## Features
 
 - **Device connection panel** — RouterOS API (port 8728) with saved device
@@ -52,13 +56,25 @@ channel recommendation engine.
   on contiguous-grid bands also the cleanest **40/80 MHz blocks** (scored
   by their worst member channel).
 - **Band + range control** — 2.4 / 5 / 6 GHz toggle with a dual-thumb
-  frequency-range slider.
+  frequency-range slider. The slider filters the view; RouterOS tools
+  always sweep the interface's `scan-list`, so the panel shows the
+  device's effective sweep range and offers **Apply** (writes
+  `scan-list=<min>-<max>` to the device — a narrower list sweeps ~4×
+  faster) and **Restore** (puts the remembered original back).
 - **Scan control** — start/stop, 1/2/5 s interval, normal vs spectral mode.
 - **History & compare** — save scans to local storage and overlay a saved
   scan on the live spectrum.
-- **CSV export** for the network list and the usage sweep; PNG export for
-  the spectrum chart. Connection fields persist across sessions and
-  successful targets are saved as profiles automatically (never passwords).
+- **Sector health (non-disruptive)** — the registration table and
+  `monitor once` are polled every 2 s without ever taking the radio off its
+  service channel: live subscriber list (signal, SNR, CCQ, PHY rates,
+  traffic, TDMA stats) with per-client signal sparklines, plus the active
+  channel and its real noise floor. The active channel is marked in green
+  on the spectrum, the usage chart and the heatmap, and the recommendation
+  compares it against the suggested channel ("switch saves N pts").
+- **CSV export** for the network list, the usage sweep and the client list;
+  PNG export for the spectrum chart. Connection fields persist across
+  sessions and successful targets are saved as profiles automatically
+  (never passwords).
 - **Dark theme by default**, light theme toggle, responsive layout.
 - **Cross-mode analysis** — the network list survives switching into usage
   mode and the last usage sweep is held (10 min) when switching back, so

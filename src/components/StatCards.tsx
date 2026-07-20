@@ -1,6 +1,6 @@
 "use client";
 
-import { Antenna, GaugeCircle, Signal, Waves } from "lucide-react";
+import { Antenna, GaugeCircle, RadioTower, Signal, Waves } from "lucide-react";
 import { heatColor } from "./ChannelHeatmap";
 import type { Scanner } from "@/hooks/useScanner";
 import type { ReactNode } from "react";
@@ -46,12 +46,24 @@ function Tile({
 }
 
 export function StatCards({ scanner }: { scanner: Scanner }) {
-  const { snapshot, avgCongestion, recommendation, interference } = scanner;
+  const { snapshot, avgCongestion, recommendation, interference, sector } = scanner;
   const nets = snapshot?.networks ?? [];
   const strongest = nets[0];
 
   return (
-    <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+      <Tile
+        icon={<RadioTower size={17} />}
+        label="Active channel"
+        value={sector?.channel ? String(sector.channel.freq) : "—"}
+        suffix={sector?.channel ? "MHz" : undefined}
+        accent="var(--good)"
+        hint={
+          sector
+            ? `${sector.clients.length} client${sector.clients.length === 1 ? "" : "s"}${sector.noiseFloor !== undefined ? ` · NF ${sector.noiseFloor} dBm` : ""}`
+            : undefined
+        }
+      />
       <Tile
         icon={<Antenna size={17} />}
         label="Networks found"

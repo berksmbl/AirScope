@@ -133,7 +133,9 @@ export function SpectrumChart({ scanner }: { scanner: Scanner }) {
     range,
     compareScan,
     interference,
+    sector,
   } = scanner;
+  const active = sector?.channel ?? null;
   const containerRef = useRef<HTMLDivElement>(null);
 
   const [zoom, setZoom] = useState<[number, number] | null>(null);
@@ -266,6 +268,20 @@ export function SpectrumChart({ scanner }: { scanner: Scanner }) {
                   axisLine={false}
                   tickFormatter={(v: number) => `${v}`}
                 />
+
+                {/* our own service channel */}
+                {active &&
+                  active.freq + active.width / 2 >= domain[0] &&
+                  active.freq - active.width / 2 <= domain[1] && (
+                    <ReferenceArea
+                      x1={Math.max(domain[0], active.freq - active.width / 2)}
+                      x2={Math.min(domain[1], active.freq + active.width / 2)}
+                      fill="var(--good)"
+                      fillOpacity={0.1}
+                      stroke="var(--good)"
+                      strokeOpacity={0.55}
+                    />
+                  )}
 
                 {/* network occupancy bands */}
                 {visibleNets.slice(0, 10).map((n) => {
@@ -408,6 +424,12 @@ export function SpectrumChart({ scanner }: { scanner: Scanner }) {
                 <span className="flex items-center gap-1.5">
                   <span className="h-2.5 w-4 rounded-sm border border-dashed border-[var(--warn)] bg-[var(--warn)]/10" />
                   Non–Wi-Fi energy
+                </span>
+              )}
+              {active && (
+                <span className="flex items-center gap-1.5">
+                  <span className="h-2.5 w-4 rounded-sm border border-[var(--good)] bg-[var(--good)]/15" />
+                  Active channel · {active.freq} MHz
                 </span>
               )}
               {compareScan && (

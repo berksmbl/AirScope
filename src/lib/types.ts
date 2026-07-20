@@ -20,6 +20,15 @@ export interface WirelessIface {
   /** e.g. "ap-bridge", "station" */
   mode?: string;
   ssid?: string;
+  /** the range(s) scan & frequency-monitor actually sweep, e.g. "5000-6000" */
+  scanList?: string;
+}
+
+/** device scan-list state as tracked by the server */
+export interface ScanListInfo {
+  current: string;
+  /** pre-change value the server remembers, null if we haven't touched it */
+  original: string | null;
 }
 
 export interface DeviceInfo {
@@ -30,6 +39,45 @@ export interface DeviceInfo {
   interfaces: WirelessIface[];
   /** which RouterOS package exposes them */
   wifiKind: "wireless" | "wifi" | "none";
+}
+
+/** one subscriber CPE registered on our sector (registration-table row) */
+export interface SectorClient {
+  mac: string;
+  radioName?: string;
+  /** dBm, as heard by the AP */
+  signal: number;
+  /** signal-to-noise, dB */
+  snr?: number;
+  /** rx-ccq link quality, % */
+  ccq?: number;
+  txRate?: string;
+  rxRate?: string;
+  /** cumulative bytes since registration */
+  txBytes: number;
+  rxBytes: number;
+  uptime?: string;
+  /** TDMA distance units */
+  distance?: number;
+  /** TDMA retransmissions */
+  retx?: number;
+  version?: string;
+}
+
+/**
+ * Live health of our own radio + subscribers — read without taking the
+ * radio off its service channel (monitor once + registration-table).
+ */
+export interface SectorStatus {
+  /** e.g. "running-ap" */
+  status?: string;
+  /** the channel we are serving on right now */
+  channel?: { freq: number; width: number };
+  /** real noise floor measured ON the active channel, dBm */
+  noiseFloor?: number;
+  /** e.g. "nv2", "802.11" */
+  protocol?: string;
+  clients: SectorClient[];
 }
 
 export interface DetectedNetwork {
