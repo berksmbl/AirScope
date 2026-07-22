@@ -1,8 +1,9 @@
-import { BANDS } from "./bands";
+import { BANDS, channelForFrequency } from "./bands";
 import { clamp } from "./utils";
 import type {
   Band,
   ChannelStat,
+  Confidence,
   DetectedNetwork,
   FreqUsagePoint,
   InterferenceRegion,
@@ -22,68 +23,193 @@ function overlapFraction(
   return Math.max(0, hi - lo) / chanWidth;
 }
 
+/** value at percentile p (0..1) of a bin's occurrence histogram */
+function percentileOf(hist: number[] | undefined, samples: number, p: number): number | null {
+  if (!hist || samples <= 0) return null;
+  const target = samples * p;
+  let cum = 0;
+  for (let i = 0; i < hist.length; i++) {
+    cum += hist[i];
+    if (cum >= target) return Math.min(100, i * 5 + 2.5); // bucket midpoint
+  }
+  return 100;
+}
+
 /**
- * Congestion per channel from two independent measurements:
- *
- * - `wifiScore` — detected networks: each overlapping AP contributes by
- *   strength (a -50 dBm neighbor hurts far more than a -90 dBm one) and by
- *   how much of the channel it occupies.
- * - `rfScore`  — measured airtime % from the device's frequency monitor,
- *   using each bin's max-hold peak so TDD/bursty transmitters count even
- *   when the latest sweep happened to catch them idle. This also covers
- *   non-Wi-Fi sources (microwave ovens, radar, analog senders) that a
- *   network scan is blind to.
- *
- * The combined `score` is the worse of the two; `nonWifi` flags channels
- * that overlap a detected interference region.
+ * Everything the scorer needs that is constant across candidate windows.
+ * Building it once keeps the per-window work cheap and lets the noise
+ * term be judged against the quietest part of the band actually measured.
  */
-export function computeChannelStats(
+export interface ScoreContext {
+  networks: DetectedNetwork[];
+  usage: FreqUsagePoint[];
+  interference: InterferenceRegion[];
+  /** quietest measured noise floor in the sweep, dBm — the reference for the noise penalty */
+  refNoise: number | null;
+}
+
+export function makeScoreContext(
   networks: DetectedNetwork[],
-  band: Band,
   usage: FreqUsagePoint[],
   interference: InterferenceRegion[] = []
-): ChannelStat[] {
-  return BANDS[band].channels.map(({ channel, freq }) => {
-    let wifi = 0;
-    let count = 0;
-    let strongest: number | null = null;
-    for (const n of networks) {
-      const overlap = overlapFraction(freq, 20, n.frequency, n.width);
-      if (overlap <= 0.02) continue;
+): ScoreContext {
+  let refNoise: number | null = null;
+  for (const u of usage) {
+    if (Number.isFinite(u.noise) && (refNoise === null || u.noise < refNoise)) {
+      refNoise = u.noise;
+    }
+  }
+  return { networks, usage, interference, refNoise };
+}
+
+const confidenceOf = (samples: number): Confidence =>
+  samples >= 40 ? "high" : samples >= 10 ? "medium" : "low";
+
+/** pseudo-observations of the presence-based prior, for shrinkage on thin data */
+const PRIOR_WEIGHT = 5;
+
+/**
+ * Score an arbitrary channel window (center + width) — the core primitive
+ * behind both the congestion profile and the recommendation. Any center
+ * frequency is valid, which is what superchannel radios need.
+ *
+ * Two independent signals are combined:
+ *
+ * - `wifiScore` — *interference potential* from detected networks. In-band
+ *   neighbours count by strength and overlap; neighbours just outside the
+ *   window still count through an adjacent-channel skirt, because a strong
+ *   carrier next door desensitises the receiver even when it never overlaps.
+ *   An AP that is idle right now still belongs here: it will transmit later.
+ *
+ * - `rfScore` — *measured occupancy*, from the per-bin occurrence
+ *   histograms rather than a max-hold peak. Max-hold only ever grows, so
+ *   after a long observation every bin approaches its all-time maximum and
+ *   the ranking collapses; percentiles stay stable. p50 is the typical
+ *   load, p95 the near-worst case, and their spread is burstiness — which
+ *   TDMA links feel more sharply than steady load. The measured noise
+ *   floor is folded in here too: at equal airtime, 9 dB of extra noise is
+ *   roughly a modulation step of lost capacity.
+ *
+ * The two are fused as `worse + 25% of the other` (never `max`, which
+ * throws information away), and the measured half is shrunk toward the
+ * presence prior while samples are still thin.
+ */
+export function scoreWindow(center: number, width: number, ctx: ScoreContext): ChannelStat {
+  const half = width / 2;
+  const { networks, usage, interference, refNoise } = ctx;
+
+  // ── interference potential ──
+  let wifi = 0;
+  let count = 0;
+  let strongest: number | null = null;
+  for (const n of networks) {
+    // -95 dBm -> 0, -50 dBm -> 45; strong signals weigh superlinearly
+    const strength = clamp(n.signal + 95, 0, 45);
+    if (strength <= 0) continue;
+    const weighted = strength * (0.65 + strength / 60);
+
+    const overlap = overlapFraction(center, width, n.frequency, n.width);
+    if (overlap > 0.02) {
       count++;
       strongest = strongest === null ? n.signal : Math.max(strongest, n.signal);
-      // -95 dBm -> 0, -50 dBm -> 45; strong signals weigh superlinearly
-      const strength = clamp(n.signal + 95, 0, 45);
-      wifi += overlap * strength * (0.65 + strength / 60);
+      wifi += overlap * weighted;
+      continue;
     }
-    const wifiScore = Math.round(clamp(wifi, 0, 100));
+    // adjacent-channel skirt: edge-to-edge gap, decaying with separation
+    const gap = Math.abs(n.frequency - center) - (width + n.width) / 2;
+    if (gap >= 0 && gap < 40) wifi += weighted * 0.35 * Math.exp(-gap / 15);
+  }
+  const wifiScore = Math.round(clamp(wifi, 0, 100));
 
-    // measured airtime from max-hold peaks: average the channel's bins,
-    // weight the busiest bin in so a single carrier is not diluted
-    let rfScore = 0;
-    let sum = 0;
-    let peak = 0;
-    let bins = 0;
-    for (const u of usage) {
-      if (u.freq < freq - 10 || u.freq > freq + 10) continue;
-      const held = u.peak ?? u.usage;
-      sum += held;
-      peak = Math.max(peak, held);
-      bins++;
+  // ── measured occupancy ──
+  const p50s: number[] = [];
+  const p95s: number[] = [];
+  let noiseSum = 0;
+  let noiseBins = 0;
+  let minSamples = Infinity;
+  for (const u of usage) {
+    if (u.freq < center - half || u.freq > center + half) continue;
+    const s = u.samples ?? 0;
+    const p50 = percentileOf(u.hist, s, 0.5);
+    const p95 = percentileOf(u.hist, s, 0.95);
+    // stored scans (and the first sweep) carry no histogram — fall back
+    p50s.push(p50 ?? u.usage);
+    p95s.push(p95 ?? u.peak ?? u.usage);
+    minSamples = Math.min(minSamples, s);
+    if (Number.isFinite(u.noise)) {
+      noiseSum += u.noise;
+      noiseBins++;
     }
-    if (bins > 0) rfScore = Math.round(clamp((sum / bins) * 0.6 + peak * 0.4, 0, 100));
+  }
 
-    return {
-      channel,
-      freq,
-      score: Math.max(wifiScore, Math.round(rfScore * 0.9)),
-      wifiScore,
-      rfScore,
-      nonWifi: interference.some((r) => r.to >= freq - 10 && r.from <= freq + 10),
-      networks: count,
-      strongest,
-    };
-  });
+  const measuredBins = p50s.length;
+  const samples = measuredBins > 0 && Number.isFinite(minSamples) ? minSamples : 0;
+  // typical load across the window, but near-worst of its busiest sub-band:
+  // one hot 5 MHz slice ruins the whole channel
+  const p50 = measuredBins ? p50s.reduce((a, b) => a + b, 0) / measuredBins : 0;
+  const p95 = measuredBins ? Math.max(...p95s) : 0;
+  const burst = Math.max(0, p95 - p50);
+  const noiseFloor = noiseBins ? Math.round(noiseSum / noiseBins) : null;
+
+  // airtime + burstiness + excess noise, all on the same 0..100 scale
+  const airtime = 0.55 * p50 + 0.45 * p95;
+  const burstPenalty = Math.min(12, burst * 0.15);
+  const noisePenalty =
+    noiseFloor !== null && refNoise !== null
+      ? clamp((noiseFloor - refNoise) * 2.5, 0, 25)
+      : 0;
+  const measured = clamp(airtime + burstPenalty + noisePenalty, 0, 100);
+
+  // thin data leans on the presence prior; plentiful data speaks for itself
+  const shrunk =
+    measuredBins === 0
+      ? wifiScore
+      : (measured * samples + wifiScore * PRIOR_WEIGHT) / (samples + PRIOR_WEIGHT);
+
+  const hi = Math.max(shrunk, wifiScore);
+  const lo = Math.min(shrunk, wifiScore);
+
+  return {
+    channel: null,
+    freq: center,
+    width,
+    score: Math.round(clamp(hi + lo * 0.25, 0, 100)),
+    wifiScore,
+    rfScore: Math.round(measured),
+    p50: Math.round(p50 * 10) / 10,
+    p95: Math.round(p95 * 10) / 10,
+    burst: Math.round(burst * 10) / 10,
+    noiseFloor,
+    nonWifi: interference.some((r) => r.to >= center - half && r.from <= center + half),
+    networks: count,
+    strongest,
+    samples,
+    confidence: confidenceOf(samples),
+  };
+}
+
+/**
+ * Congestion as a function of center frequency: a sliding window stepped at
+ * the measurement's own resolution. On superchannel radios the centre is
+ * free, so a 20 MHz grid would hide most of the usable spectrum.
+ */
+export function congestionProfile(
+  ctx: ScoreContext,
+  band: Band,
+  rangeMin: number,
+  rangeMax: number,
+  width = 20
+): ChannelStat[] {
+  const step = candidateStep(ctx.usage);
+  const half = width / 2;
+  const out: ChannelStat[] = [];
+  const start = Math.ceil((rangeMin + half) / step) * step;
+  for (let c = start; c + half <= rangeMax; c += step) {
+    const stat = scoreWindow(c, width, ctx);
+    stat.channel = channelForFrequency(c, band);
+    out.push(stat);
+  }
+  return out;
 }
 
 /**
@@ -139,22 +265,68 @@ export function detectInterferenceFromUsage(
 const scoreLabel = (score: number) =>
   score < 20 ? "Low interference" : score < 45 ? "Moderate interference" : "Congested";
 
+/** the finest candidate spacing the measurements can honestly support */
+function candidateStep(usage: FreqUsagePoint[]): number {
+  if (usage.length < 2) return 5;
+  let spacing = Infinity;
+  for (let i = 1; i < usage.length; i++) {
+    const d = usage[i].freq - usage[i - 1].freq;
+    if (d > 0) spacing = Math.min(spacing, d);
+  }
+  return Number.isFinite(spacing) ? clamp(spacing, 1, 20) : 5;
+}
+
 /**
- * Pick the best channel: lowest combined congestion, tie-broken by distance
- * from the strongest transmitters (prefer spectrum that is quiet *and* far
- * from noise).
+ * Pick the best center frequency: lowest combined congestion, tie-broken by
+ * distance from the strongest transmitters (prefer spectrum that is quiet
+ * *and* far from noise).
+ *
+ * Candidates are scanned at the measurement's own resolution (5 MHz on
+ * RouterOS frequency-monitor) rather than the standard 20 MHz grid, because
+ * superchannel radios can tune anywhere — the cleanest spot is often
+ * between grid channels. Alternates are forced at least one channel width
+ * apart so they are genuinely different options, not neighbouring offsets.
  */
 export function recommend(
-  channels: ChannelStat[],
-  networks: DetectedNetwork[],
+  ctx: ScoreContext,
   rangeMin: number,
-  rangeMax: number
+  rangeMax: number,
+  band: Band,
+  opts: {
+    /** width the operator will actually deploy */
+    width?: number;
+    /** currently shown pick — kept unless a rival wins by `margin` (anti-flap) */
+    preferFreq?: number | null;
+    margin?: number;
+  } = {}
 ): Recommendation | null {
-  const inRange = channels.filter((c) => c.freq >= rangeMin && c.freq <= rangeMax);
-  if (inRange.length === 0) return null;
+  const width = opts.width ?? 20;
+  const margin = opts.margin ?? 5;
+  const step = candidateStep(ctx.usage);
+  const strongAPs = ctx.networks.filter((n) => n.signal > -75);
 
-  const strongAPs = networks.filter((n) => n.signal > -75);
-  const scored = inRange
+  /** every center whose full window fits inside the selected range */
+  const centers = (w: number): number[] => {
+    const half = w / 2;
+    const out: number[] = [];
+    const start = Math.ceil((rangeMin + half) / step) * step;
+    for (let c = start; c + half <= rangeMax; c += step) out.push(c);
+    return out;
+  };
+
+  /** a window is only as good as its busiest 20 MHz part */
+  const worstSub = (center: number, w: number): ChannelStat => {
+    if (w <= 20) return scoreWindow(center, w, ctx);
+    let worst: ChannelStat | null = null;
+    for (let sub = center - w / 2 + 10; sub <= center + w / 2 - 10; sub += 20) {
+      const s = scoreWindow(sub, 20, ctx);
+      if (!worst || s.score > worst.score) worst = s;
+    }
+    return { ...(worst as ChannelStat), freq: center, width: w };
+  };
+
+  const scored = centers(width)
+    .map((c) => worstSub(c, width))
     .map((c) => {
       const nearestStrong = strongAPs.length
         ? Math.min(...strongAPs.map((n) => Math.abs(n.frequency - c.freq)))
@@ -165,55 +337,71 @@ export function recommend(
     })
     .sort((a, b) => a.fitness - b.fitness);
 
-  const best = scored[0];
+  if (scored.length === 0) return null;
+
+  // keep picks a full channel apart, otherwise "alternatives" are just the
+  // same channel shifted by one bin
+  const picks: typeof scored = [];
+  for (const c of scored) {
+    if (picks.every((p) => Math.abs(p.freq - c.freq) >= width)) picks.push(c);
+    if (picks.length >= 4) break;
+  }
+
+  // hysteresis: a near-tie should not make the recommendation jump around
+  if (opts.preferFreq != null) {
+    const held = scored.find((c) => Math.abs(c.freq - opts.preferFreq!) < step / 2);
+    if (held && held.fitness <= picks[0].fitness + margin) {
+      const rest = picks.filter((p) => p.freq !== held.freq);
+      picks.length = 0;
+      picks.push(held, ...rest.slice(0, 3));
+    }
+  }
+
+  const best = picks[0];
   let reason: string;
-  if (best.networks === 0 && best.rfScore < 15) {
-    reason = "No networks and no measured airtime on this channel";
+  if (best.networks === 0 && best.p95 < 15) {
+    reason = "No networks and no measured airtime here";
   } else if (best.networks === 0) {
-    reason = `No networks; residual airtime ${best.rfScore}/100`;
+    reason = `No networks; airtime ${best.p50}% typical / ${best.p95}% peak`;
   } else {
     reason = `${best.networks} weak overlapping ${best.networks === 1 ? "network" : "networks"}, strongest at ${best.strongest} dBm`;
   }
+  if (best.burst >= 25) reason += `, bursty (+${Math.round(best.burst)}%)`;
   if (best.nonWifi) reason += " — carries non-Wi-Fi energy";
+  if (best.confidence === "low") reason += " · still gathering samples";
 
-  // cleanest contiguous 40/80 MHz blocks (only on bands with a contiguous
-  // 20 MHz grid — 2.4 GHz channels overlap, so blocks don't apply there).
-  // A block is only as good as its worst member.
+  // Wider bonded channels than the deployed width, for planning ahead
   const blocks: Recommendation["blocks"] = [];
-  const contiguous = inRange.every(
-    (c, i, arr) => i === 0 || c.freq - arr[i - 1].freq === 20
-  );
-  if (contiguous) {
-    for (const width of [40, 80]) {
-      const n = width / 20;
-      if (inRange.length < n) continue;
-      let bestBlock: Recommendation["blocks"][number] | null = null;
-      for (let i = 0; i + n <= inRange.length; i++) {
-        const slice = inRange.slice(i, i + n);
-        const worst = Math.max(...slice.map((c) => c.score));
-        if (!bestBlock || worst < bestBlock.score) {
-          bestBlock = {
-            width,
-            freq: (slice[0].freq + slice[n - 1].freq) / 2,
-            from: slice[0].freq - 10,
-            to: slice[n - 1].freq + 10,
-            score: worst,
-          };
-        }
+  for (const w of [40, 80]) {
+    if (w <= width || rangeMax - rangeMin < w) continue;
+    let bestBlock: Recommendation["blocks"][number] | null = null;
+    for (const center of centers(w)) {
+      const s = worstSub(center, w);
+      if (!bestBlock || s.score < bestBlock.score) {
+        bestBlock = {
+          width: w,
+          freq: center,
+          from: center - w / 2,
+          to: center + w / 2,
+          score: s.score,
+        };
       }
-      if (bestBlock) blocks.push(bestBlock);
     }
+    if (bestBlock) blocks.push(bestBlock);
   }
 
   return {
     freq: best.freq,
-    channel: best.channel,
+    channel: channelForFrequency(best.freq, band),
+    width,
     score: best.score,
     label: scoreLabel(best.score),
     reason,
-    alternates: scored.slice(1, 4).map((c) => ({
+    confidence: best.confidence,
+    stat: best,
+    alternates: picks.slice(1, 4).map((c) => ({
       freq: c.freq,
-      channel: c.channel,
+      channel: channelForFrequency(c.freq, band),
       score: c.score,
     })),
     blocks,

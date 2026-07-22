@@ -37,17 +37,50 @@ export function RecommendationCard({ scanner }: { scanner: Scanner }) {
             <div className="text-[11px] font-medium uppercase tracking-wider text-good">
               Best channel
             </div>
-            <div className="mt-0.5 flex items-baseline gap-2">
+            <div className="mt-0.5 flex flex-wrap items-baseline gap-2">
               <span className="mono text-[26px] font-semibold leading-none text-ink">
                 {recommendation.freq}
                 <span className="ml-1 text-[13px] font-normal text-ink-3">MHz</span>
               </span>
+              <Chip className="mono">{recommendation.width} MHz</Chip>
               <Chip color={recommendation.score < 20 ? "good" : recommendation.score < 45 ? "warn" : "critical"}>
                 {recommendation.label}
               </Chip>
+              <Chip
+                color={
+                  recommendation.confidence === "high"
+                    ? "good"
+                    : recommendation.confidence === "medium"
+                      ? "warn"
+                      : "critical"
+                }
+                title={`${recommendation.stat.samples} readings behind the least-measured bin of this channel`}
+              >
+                {recommendation.confidence} confidence
+              </Chip>
             </div>
             <div className="mt-1 text-[12px] text-ink-2">
-              Channel {recommendation.channel} · {recommendation.reason}
+              {recommendation.channel !== null && `Channel ${recommendation.channel} · `}
+              {recommendation.reason}
+            </div>
+            {/* the measurements behind the score */}
+            <div className="mono mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-ink-3">
+              <span title="typical / near-worst airtime">
+                air {recommendation.stat.p50}% / {recommendation.stat.p95}%
+              </span>
+              {recommendation.stat.noiseFloor !== null && (
+                <span title="mean measured noise floor in this channel">
+                  NF {recommendation.stat.noiseFloor} dBm
+                </span>
+              )}
+              {recommendation.stat.burst >= 10 && (
+                <span className="text-warn" title="p95 − p50 spread; TDMA dislikes variance">
+                  burst +{recommendation.stat.burst}%
+                </span>
+              )}
+              <span title="interference potential from detected networks (in-band + adjacent)">
+                nbr {recommendation.stat.wifiScore}
+              </span>
             </div>
           </button>
 
@@ -134,7 +167,7 @@ export function RecommendationCard({ scanner }: { scanner: Scanner }) {
                         style={{ backgroundColor: heatColor(a.score) }}
                       />
                       <span className="mono text-ink">{a.freq} MHz</span>
-                      <span className="text-ink-3">ch {a.channel}</span>
+                      {a.channel !== null && <span className="text-ink-3">ch {a.channel}</span>}
                       <span className="mono ml-auto text-[11.5px] text-ink-2">
                         {a.score}/100
                       </span>

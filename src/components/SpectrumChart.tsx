@@ -15,7 +15,6 @@ import {
 } from "recharts";
 import { AudioWaveform, Download, SearchX, ZoomOut } from "lucide-react";
 import { Button, Card, Chip } from "./ui";
-import { Waterfall } from "./Waterfall";
 import { channelForFrequency } from "@/lib/bands";
 import type { Scanner } from "@/hooks/useScanner";
 import type { DetectedNetwork } from "@/lib/types";
@@ -123,7 +122,6 @@ function SpectrumTooltip({
 export function SpectrumChart({ scanner }: { scanner: Scanner }) {
   const {
     snapshot,
-    waterfall,
     focus,
     setFocus,
     hoverFreq,
@@ -445,21 +443,6 @@ export function SpectrumChart({ scanner }: { scanner: Scanner }) {
           </div>
         )}
 
-        {waterfall.length > 2 && (
-          <div className="mt-2 border-t border-line px-2 pt-2.5">
-            <div className="mb-1.5 flex items-center justify-between">
-              <span className="section-label">Waterfall — last {waterfall.length} sweeps</span>
-              <span className="text-[10.5px] text-ink-3">newest on top</span>
-            </div>
-            <Waterfall
-              frames={waterfall}
-              domain={domain}
-              noiseFloor={snapshot?.noiseFloor ?? -100}
-              hoverFreq={hoverFreq}
-              onHover={setHoverFreq}
-            />
-          </div>
-        )}
       </div>
     </Card>
   );

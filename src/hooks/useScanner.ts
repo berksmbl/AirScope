@@ -4,8 +4,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BANDS, bandForFrequency } from "@/lib/bands";
 import {
   averageCongestion,
-  computeChannelStats,
+  congestionProfile,
   detectInterferenceFromUsage,
+  makeScoreContext,
   recommend,
   synthesizeSpectrum,
 } from "@/lib/analysis";
@@ -22,7 +23,6 @@ import type {
   ScanMode,
   ScanSnapshot,
   SectorStatus,
-  SpectrumPoint,
   StoredScan,
 } from "@/lib/types";
 
@@ -71,6 +71,8 @@ export function useScanner() {
     BANDS["5g"].defaultMax,
   ]);
   const [mode, setMode] = useState<ScanMode>("scan");
+  /** channel width the operator deploys — drives the congestion profile */
+  const [width, setWidth] = useState(20);
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState<string | null>(null);
   /** how long the device-side tool has been collecting, seconds */
@@ -78,7 +80,6 @@ export function useScanner() {
 
   // ── data ──
   const [snapshot, setSnapshot] = useState<ScanSnapshot | null>(null);
-  const [waterfall, setWaterfall] = useState<SpectrumPoint[][]>([]);
   const [focus, setFocus] = useState<Focus | null>(null);
   /** live sector health — polled independently of scanning (non-disruptive) */
   const [sector, setSector] = useState<SectorStatus | null>(null);
@@ -100,10 +101,14 @@ export function useScanner() {
 
   const tickRef = useRef(0);
   // band/range are read by the stream consumer without restarting the stream
-  const paramsRef = useRef<{ band: Band; range: [number, number] }>({ band, range });
+  const paramsRef = useRef<{ band: Band; range: [number, number]; width: number }>({
+    band,
+    range,
+    width,
+  });
   useEffect(() => {
-    paramsRef.current = { band, range };
-  }, [band, range]);
+    paramsRef.current = { band, range, width };
+  }, [band, range, width]);
 
   // stable color slot per network (first-seen order, max 8) so colors follow
   // the entity, not its current rank in the list
@@ -115,6 +120,8 @@ export function useScanner() {
   // scan mode — so the analysis always merges both real measurements
   const netsMemory = useRef<DetectedNetwork[]>([]);
   const usageMemory = useRef<{ points: FreqUsagePoint[]; at: number } | null>(null);
+  /** last headline recommendation, for hysteresis */
+  const lastRecFreq = useRef<number | null>(null);
 
   const colorIndex = useCallback((bssid: string): number | null => {
     const idx = colorMap.current.get(bssid);
@@ -123,7 +130,6 @@ export function useScanner() {
 
   const resetData = useCallback(() => {
     setSnapshot(null);
-    setWaterfall([]);
     setFocus(null);
     setCollectingFor(0);
     setSector(null);
@@ -219,8 +225,6 @@ export function useScanner() {
         const data = await res.json();
         if (!res.ok) throw new Error(data.error ?? "scan-list update failed");
         setScanListInfo(data.scanList as ScanListInfo);
-        // monitors were restarted server-side — old frames mix ranges
-        setWaterfall([]);
         setCollectingFor(0);
         setScanError(null);
       } catch (err) {
@@ -300,7 +304,10 @@ export function useScanner() {
         .sort((a, b2) => b2.peak - a.peak)
         .slice(0, 4);
 
-      const channels = computeChannelStats(networks, b, usage, regions);
+      // congestion as a function of centre frequency, at the measurement's
+      // own resolution — superchannel radios are not bound to the 20 MHz grid
+      const ctx = makeScoreContext(networks, usage, regions);
+      const channels = congestionProfile(ctx, b, min, max, paramsRef.current.width);
       const noiseFloor = Math.round(
         usage.length > 0
           ? usage.reduce((s, u) => s + u.noise, 0) / usage.length
@@ -314,6 +321,7 @@ export function useScanner() {
         mode,
         rangeMin: min,
         rangeMax: max,
+        width: paramsRef.current.width,
         networks,
         spectrum,
         channels,
@@ -325,16 +333,6 @@ export function useScanner() {
         deviceName,
       });
 
-      // waterfall: real airtime over time while monitoring, else the envelope
-      const frame =
-        usageLive && usage.length > 0
-          ? usage.map((u) => ({
-              freq: u.freq,
-              power: u.noise + 8 + (u.usage / 100) * 45,
-              noise: u.noise,
-            }))
-          : spectrum;
-      setWaterfall((prev) => [...prev.slice(-89), frame]);
       setScanError(payload.error ?? null);
     };
 
@@ -391,44 +389,74 @@ export function useScanner() {
     };
   }, [scanning, mode, device, iface]);
 
-  // ── sector health loop ──
-  // Plain reads (monitor once + registration-table): never touch the radio's
-  // channel, so this runs whenever we're connected — scanning or not.
+  // ── sector health feed ──
+  // Plain reads (monitor once + registration-table) never touch the radio's
+  // channel, so the server pushes them whenever we're connected — scanning
+  // or not. One SSE connection, same shape as the scan feed.
   useEffect(() => {
     if (connState !== "connected" || !device || !iface || !credsRef.current) {
       return;
     }
     const creds = credsRef.current;
     let cancelled = false;
+    const ctrl = new AbortController();
 
-    const tick = async () => {
-      try {
-        const res = await fetch("/api/device/sector", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ ...creds, iface }),
-        });
-        if (!res.ok || cancelled) return;
-        const data = await res.json();
-        const s: SectorStatus = data.sector;
-        for (const c of s.clients) {
-          const h = clientHistory.current.get(c.mac) ?? [];
-          h.push({ signal: c.signal, ccq: c.ccq ?? null });
-          if (h.length > 150) h.shift();
-          clientHistory.current.set(c.mac, h);
+    const apply = (payload: { sector?: SectorStatus; error?: string }) => {
+      if (cancelled || !payload.sector) return;
+      const s = payload.sector;
+      for (const c of s.clients) {
+        const h = clientHistory.current.get(c.mac) ?? [];
+        h.push({ signal: c.signal, ccq: c.ccq ?? null });
+        if (h.length > 150) h.shift();
+        clientHistory.current.set(c.mac, h);
+      }
+      // during a sweep `monitor` can't report a channel — keep the last known
+      setSector((prev) => ({ ...s, channel: s.channel ?? prev?.channel }));
+    };
+
+    const run = async () => {
+      while (!cancelled) {
+        try {
+          const res = await fetch("/api/device/sector", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...creds, iface }),
+            signal: ctrl.signal,
+          });
+          if (!res.ok || !res.body) throw new Error("Sector feed failed");
+
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = "";
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let sep: number;
+            while ((sep = buf.indexOf("\n\n")) >= 0) {
+              const chunk = buf.slice(0, sep);
+              buf = buf.slice(sep + 2);
+              const line = chunk.split("\n").find((l) => l.startsWith("data: "));
+              if (!line) continue;
+              try {
+                apply(JSON.parse(line.slice(6)));
+              } catch {
+                /* malformed frame — skip */
+              }
+            }
+          }
+        } catch {
+          /* dropped — fall through to the backoff below */
         }
-        // during a sweep `monitor` can't report a channel — keep the last known
-        setSector((prev) => ({ ...s, channel: s.channel ?? prev?.channel }));
-      } catch {
-        /* transient — next tick retries */
+        if (cancelled) return;
+        await new Promise((r) => setTimeout(r, RECONNECT_MS));
       }
     };
 
-    void tick();
-    const id = setInterval(() => void tick(), 2000);
+    void run();
     return () => {
       cancelled = true;
-      clearInterval(id);
+      ctrl.abort();
     };
   }, [connState, device, iface]);
 
@@ -436,7 +464,6 @@ export function useScanner() {
   const setBand = useCallback((b: Band) => {
     setBandState(b);
     setRange([BANDS[b].defaultMin, BANDS[b].defaultMax]);
-    setWaterfall([]);
     setFocus(null);
     setSnapshot(null);
     colorMap.current.clear();
@@ -447,13 +474,11 @@ export function useScanner() {
 
   const setFreqRange = useCallback((min: number, max: number) => {
     setRange([min, max]);
-    setWaterfall([]);
   }, []);
 
-  /** waterfall frames mean different things per mode (dBm envelope vs airtime) */
+  /** a mode switch restarts the device-side tool — drop the stale progress */
   const selectMode = useCallback((m: ScanMode) => {
     setMode(m);
-    setWaterfall([]);
     setCollectingFor(0);
   }, []);
 
@@ -477,7 +502,19 @@ export function useScanner() {
   // ── derived ──
   const recommendation = useMemo(() => {
     if (!snapshot) return null;
-    return recommend(snapshot.channels, snapshot.networks, snapshot.rangeMin, snapshot.rangeMax);
+    const ctx = makeScoreContext(
+      snapshot.networks,
+      snapshot.usage,
+      snapshot.interference
+    );
+    const rec = recommend(ctx, snapshot.rangeMin, snapshot.rangeMax, snapshot.band, {
+      width: snapshot.width,
+      // hold the previous pick unless a rival clearly beats it, so the
+      // headline frequency does not flicker between near-equal candidates
+      preferFreq: lastRecFreq.current,
+    });
+    lastRecFreq.current = rec?.freq ?? null;
+    return rec;
   }, [snapshot]);
 
   const avgCongestion = useMemo(
@@ -546,6 +583,8 @@ export function useScanner() {
     setFreqRange,
     mode,
     setMode: selectMode,
+    width,
+    setWidth,
     scanning,
     setScanning,
     scanError,
@@ -556,7 +595,6 @@ export function useScanner() {
     restoreDeviceScanList,
     // data
     snapshot,
-    waterfall,
     focus,
     setFocus,
     hoverFreq,

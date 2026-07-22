@@ -26,10 +26,10 @@ channel recommendation engine.
   - **Freq. usage** — the Winbox "Freq. Usage" tool as a live stream:
     real per-frequency airtime % and noise floor, accumulated server-side
     while the radio sweeps the band (~200 bins in 45–60 s, then refreshes).
-    Every bin also keeps a **max-hold peak** across sweeps, so TDD/bursty
-    transmitters that happen to be idle during one sweep's dwell still
-    register; channel scores and interference detection use the peaks.
-    A reset button starts a fresh observation window.
+    Every bin keeps a **max-hold peak** and an occurrence **histogram**
+    across sweeps, so TDD/bursty transmitters that happen to be idle during
+    one sweep's dwell still register. A reset button starts a fresh
+    observation window.
 - **Persistence (CDF) view** — a Mimosa-style display: each frequency
   column is colored by how *often* every airtime level occurs (red =
   always, purple = rare bursts), from per-bin occurrence histograms
@@ -38,12 +38,12 @@ channel recommendation engine.
   usage card.
 - **Live spectrum graph** — dBm vs MHz, signal power + noise floor,
   per-network occupancy bands, drag-to-zoom, hover tooltip, PNG export.
-- **Spectral waterfall** — scrolling spectrogram of recent sweeps.
-- **Channel heatmap** — one cell per 20 MHz channel, green → yellow → red.
-  The score is the worse of two independent measurements: Wi-Fi congestion
-  (detected networks) and **raw frequency usage** (spectrum energy above the
-  noise floor), so channels busy with non-Wi-Fi energy show hot even when no
-  network is detected there. Click a cell to highlight it on the spectrum.
+- **Channel congestion strip** — congestion of a channel *centred at each
+  frequency*, stepped at the measurement resolution rather than a 20 MHz
+  grid, because superchannel radios can sit anywhere. Width selector
+  (20/40/80 MHz) rescores the whole profile; hovering any point shows the
+  full breakdown (airtime typical/peak, burstiness, noise floor, neighbours,
+  sample count and confidence).
 - **Non-Wi-Fi interference detection** — spectrum regions whose energy the
   detected networks cannot explain (microwave ovens, radar, analog senders,
   non-802.11 links) are flagged as chips under the heatmap, marked on the
@@ -51,17 +51,24 @@ channel recommendation engine.
   sources are held (max-hold) for a few sweeps so they stay visible.
 - **Network list** — SSID, BSSID, frequency/channel, width, security, and a
   signal bar; clicking a row highlights the network on the graph.
-- **Smart recommendation** — scores every channel by overlapping signal
-  strength and occupancy, suggests the best frequency plus alternates, and
-  on contiguous-grid bands also the cleanest **40/80 MHz blocks** (scored
-  by their worst member channel).
+- **Smart recommendation** — scans candidate centres at the measurement's
+  own resolution and fuses two independent signals: *interference potential*
+  from detected networks (in-band overlap plus an adjacent-channel skirt)
+  and *measured occupancy* from per-bin airtime percentiles (p50/p95, never
+  a saturating max-hold), with penalties for burstiness and for excess noise
+  floor. Thin data is shrunk toward the presence prior and reported as a
+  confidence level; hysteresis stops the headline pick from flapping.
+  Alternates are forced a channel apart, and wider **40/80 MHz blocks** are
+  scored by their busiest 20 MHz sub-window.
 - **Band + range control** — 2.4 / 5 / 6 GHz toggle with a dual-thumb
   frequency-range slider. The slider filters the view; RouterOS tools
   always sweep the interface's `scan-list`, so the panel shows the
   device's effective sweep range and offers **Apply** (writes
   `scan-list=<min>-<max>` to the device — a narrower list sweeps ~4×
   faster) and **Restore** (puts the remembered original back).
-- **Scan control** — start/stop, 1/2/5 s interval, normal vs spectral mode.
+- **Scan control** — start/stop and mode (Networks / Freq. usage). Scanning
+  is always manual: connecting never starts it, so the range, mode and
+  scan-list can be set first.
 - **History & compare** — save scans to local storage and overlay a saved
   scan on the live spectrum.
 - **Sector health (non-disruptive)** — the registration table and
@@ -79,8 +86,8 @@ channel recommendation engine.
 - **Cross-mode analysis** — the network list survives switching into usage
   mode and the last usage sweep is held (10 min) when switching back, so
   the recommendation engine always merges both real measurements. On
-  connect, the app selects the radio's own band and starts scanning
-  automatically.
+  connect the app selects the radio's own band, but leaves starting the
+  scan to you.
 
 ## Getting started
 
@@ -91,8 +98,8 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:3000 and connect to your router — scanning starts
-automatically once connected.
+Open http://localhost:3000 and connect to your router, then press
+**Start scan**.
 
 ### Connecting a real MikroTik
 
@@ -104,7 +111,7 @@ Notes:
 
 - The 5 GHz band covers the full superchannel span the radio sweeps
   (5000–6000 MHz), so WISP links on non-standard frequencies (5045, 5115, …)
-  are scored and shown; heatmap cells are labeled in MHz on this band.
+  are scored and shown.
 - Foreground scanning and frequency monitoring take the radio off its
   service channel — expect interrupted client traffic on that interface
   while a scan runs (background scan avoids this where supported).
@@ -131,16 +138,20 @@ src/
 │   └── api/device/
 │       ├── connect/route.ts      # POST — verify creds, return identity + interfaces
 │       ├── stream/route.ts       # POST — live SSE feed (1 Hz push of scan/usage state)
+│       ├── sector/route.ts       # POST — non-disruptive clients + active channel
+│       ├── scanlist/route.ts     # POST — read/apply/restore the device scan-list
 │       └── scan/route.ts         # POST — one-shot snapshot + peak reset
 ├── components/
 │   ├── Header.tsx                # brand, status pill, theme toggle
-│   ├── ConnectionPanel.tsx       # creds, profiles, demo-mode switch
-│   ├── ScanControls.tsx          # band, range, mode, interval, start/stop
+│   ├── ConnectionPanel.tsx       # creds, saved device profiles
+│   ├── ScanControls.tsx          # band, range, width, mode, scan-list, start/stop
 │   ├── StatCards.tsx             # networks / congestion / best channel / noise
 │   ├── SpectrumChart.tsx         # Recharts spectrum + zoom + export
-│   ├── Waterfall.tsx             # canvas spectrogram
-│   ├── ChannelHeatmap.tsx        # congestion grid
+│   ├── FrequencyUsageChart.tsx   # measured airtime + max-hold + CDF toggle
+│   ├── PersistenceView.tsx       # Mimosa-style occurrence (CDF) canvas
+│   ├── ChannelHeatmap.tsx        # sliding-window congestion strip
 │   ├── NetworkList.tsx           # detected APs
+│   ├── SectorPanel.tsx           # own subscribers (collapsed summary)
 │   ├── RecommendationCard.tsx    # best channel + alternates
 │   └── HistoryPanel.tsx          # saved scans + compare
 ├── hooks/useScanner.ts           # central state machine + scan loop
@@ -157,7 +168,7 @@ SSE over a POST body so credentials never touch the URL) → the server
 pushes the accumulated state of its continuous RouterOS streams (scanner
 or frequency monitor) once a second → congestion scores, interference
 regions, and the recommendation computed client-side → chart, heatmap,
-waterfall, and list all render from the same snapshot. The client
+congestion strip, and list all render from the same snapshot. The client
 reconnects automatically with a short backoff if the stream drops;
 `POST /api/device/scan` remains for one-shot actions (peak reset).
 

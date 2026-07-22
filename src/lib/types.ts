@@ -108,21 +108,43 @@ export interface SpectrumPoint {
   noise: number;
 }
 
+export type Confidence = "low" | "medium" | "high";
+
+/**
+ * Congestion of one channel window (any center frequency + width).
+ * Superchannel radios tune anywhere, so centers are not restricted to
+ * the standard 20 MHz grid.
+ */
 export interface ChannelStat {
-  channel: number;
+  /** standard channel number when the center lands on the grid, else null */
+  channel: number | null;
+  /** center frequency, MHz */
   freq: number;
+  /** window width this was scored for, MHz */
+  width: number;
   /** combined congestion score 0 (clean) .. 100 (saturated) */
   score: number;
-  /** contribution from detected Wi-Fi networks */
+  /** interference potential from detected networks (in-band + adjacent) */
   wifiScore: number;
-  /** contribution from raw spectrum energy (frequency usage) */
+  /** measured occupancy contribution (airtime percentiles + noise + burst) */
   rfScore: number;
+  /** typical airtime across the window, % (mean of per-bin medians) */
+  p50: number;
+  /** near-worst airtime, % (max of per-bin 95th percentiles) */
+  p95: number;
+  /** burstiness = p95 - p50; TDMA suffers more from variance than from load */
+  burst: number;
+  /** mean measured noise floor inside the window, dBm */
+  noiseFloor: number | null;
   /** significant RF energy not explained by any detected network */
   nonWifi: boolean;
-  /** number of networks overlapping this channel */
+  /** number of networks overlapping this window */
   networks: number;
   /** strongest overlapping signal, dBm */
   strongest: number | null;
+  /** readings behind the least-measured bin in this window */
+  samples: number;
+  confidence: Confidence;
 }
 
 /** contiguous spectrum region with energy not attributable to Wi-Fi */
@@ -162,13 +184,20 @@ export interface FreqUsagePoint {
 
 export interface Recommendation {
   freq: number;
-  channel: number;
+  /** standard channel number, null when the center sits off the grid (superchannel) */
+  channel: number | null;
+  /** the channel width this recommendation was scored for */
+  width: number;
   score: number;
   /** e.g. "Low interference" */
   label: string;
   reason: string;
-  /** runner-up alternatives */
-  alternates: { freq: number; channel: number; score: number }[];
+  /** how much measurement backs this pick */
+  confidence: Confidence;
+  /** full scoring detail of the winning window */
+  stat: ChannelStat;
+  /** runner-up alternatives, at least one channel width apart */
+  alternates: { freq: number; channel: number | null; score: number }[];
   /**
    * cleanest contiguous wider blocks (40/80 MHz) — scored by their WORST
    * member channel, since one busy channel ruins the whole bond
@@ -183,8 +212,11 @@ export interface ScanSnapshot {
   mode: ScanMode;
   rangeMin: number;
   rangeMax: number;
+  /** channel width the congestion profile was scored for */
+  width: number;
   networks: DetectedNetwork[];
   spectrum: SpectrumPoint[];
+  /** congestion vs centre frequency, at measurement resolution */
   channels: ChannelStat[];
   interference: InterferenceRegion[];
   /** per-frequency airtime usage measured by the device's frequency monitor */
