@@ -1,3 +1,4 @@
+import "./rosPatch"; // must load before any Channel is created
 import { RouterOSAPI } from "node-routeros";
 import type { RStream } from "node-routeros/dist/RStream";
 import { BANDS, bandForFrequency } from "./bands";
